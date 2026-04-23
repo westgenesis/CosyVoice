@@ -4,8 +4,8 @@ services:
   cosyvoice:
     image: cosyvoice:v0.1
     volumes:
-      - C:\Users\chise\Documents\project\CosyVoice\pretrained_models:/opt/CosyVoice/pretrained_models
-      - C:\Users\chise\Documents\project\CosyVoice\.cache:/root/.cache
+      - ./pretrained_models:/opt/CosyVoice/pretrained_models
+      - ./cache:/root/.cache
     container_name: cosyvoice
     ports:
       - "50000:50000"
