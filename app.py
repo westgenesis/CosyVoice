@@ -28,20 +28,18 @@ from cosyvoice.utils.common import set_all_random_seed
 
 class InferenceMode(str, Enum):
     """推理模式"""
-    PRETRAINED    = "预训练音色"
-    ZERO_SHOT     = "3s极速复刻"
+    PRETRAINED = "预训练音色"
+    ZERO_SHOT = "3s极速复刻"
     CROSS_LINGUAL = "跨语种复刻"
-    INSTRUCT      = "自然语言控制"
+    INSTRUCT = "自然语言控制"
 
 
 PROMPT_SR = 16000
-
 
 # ===================== 全局模型 =====================
 
 cosyvoice: Optional[AutoModel] = None
 sft_spk: List[str] = []
-
 
 # ===================== FastAPI 实例 =====================
 
@@ -109,14 +107,17 @@ async def get_speakers():
 
 @app.post("/api/tts", summary="语音合成（一次性返回完整音频）")
 async def text_to_speech(
-    tts_text: str = Form(..., description="需要合成的文本"),
-    mode: InferenceMode = Form(..., description="推理模式: 预训练音色 / 3s极速复刻 / 跨语种复刻 / 自然语言控制"),
-    sft_speaker: Optional[str] = Form(default="", description="预训练音色名称（预训练音色 / 自然语言控制 模式使用）"),
-    prompt_text: Optional[str] = Form(default="", description="prompt文本（3s极速复刻 模式使用，需与prompt音频内容一致）"),
-    prompt_wav: Optional[UploadFile] = File(default=None, description="prompt音频文件（3s极速复刻 / 跨语种复刻 模式使用，采样率≥16kHz，不超过30s）"),
-    instruct_text: Optional[str] = Form(default="", description="instruct文本（自然语言控制 模式使用）"),
-    seed: int = Form(default=0, description="随机推理种子，传入 0 表示随机生成"),
-    speed: float = Form(default=1.0, ge=0.5, le=2.0, description="语速调节，范围 0.5~2.0"),
+        tts_text: str = Form(..., description="需要合成的文本"),
+        mode: InferenceMode = Form(..., description="推理模式: 预训练音色 / 3s极速复刻 / 跨语种复刻 / 自然语言控制"),
+        sft_speaker: Optional[str] = Form(default=None,
+                                          description="预训练音色名称（预训练音色 / 自然语言控制 模式使用）"),
+        prompt_text: Optional[str] = Form(default=None,
+                                          description="prompt文本（3s极速复刻 模式使用，需与prompt音频内容一致）"),
+        prompt_wav: Optional[UploadFile] = File(default=None,
+                                                description="prompt音频文件（3s极速复刻 / 跨语种复刻 模式使用，采样率≥16kHz，不超过30s）"),
+        instruct_text: Optional[str] = Form(default=None, description="instruct文本（自然语言控制 模式使用）"),
+        seed: int = Form(default=0, description="随机推理种子，传入 0 表示随机生成"),
+        speed: float = Form(default=1.0, ge=0.5, le=2.0, description="语速调节，范围 0.5~2.0"),
 ):
     """
     根据指定的推理模式合成语音。
@@ -228,12 +229,13 @@ async def text_to_speech(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CosyVoice FastAPI TTS Service")
-    parser.add_argument("--port", type=int, default=8000, help="服务监听端口")
+    parser.add_argument("--port", type=int, default=50000, help="服务监听端口")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="服务监听地址")
     parser.add_argument(
         "--model_dir",
         type=str,
         default="pretrained_models/CosyVoice2-0.5B",
+        # default="pretrained_models/CosyVoice-300M-SFT",
         help="模型本地路径或 ModelScope repo id",
     )
     args = parser.parse_args()

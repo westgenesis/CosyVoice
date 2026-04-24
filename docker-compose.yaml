@@ -2,7 +2,10 @@ version: '3'
 
 services:
   cosyvoice:
-    image: cosyvoice:v0.1
+#    image: chise/cosyvoice:v0.1
+    build:
+      context: .
+      dockerfile: Dockerfile
     volumes:
       - ./pretrained_models:/opt/CosyVoice/pretrained_models
       - ./cache:/root/.cache
@@ -13,6 +16,6 @@ services:
       - HF_ENDPOINT=https://hf-mirror.com
     command:
       - "python"
-      - "runtime/python/fastapi/server.py"
+      - "fastapi.py"
       - "--model_dir=pretrained_models/CosyVoice2-0.5B"
     restart: unless-stopped
