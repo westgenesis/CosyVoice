@@ -4,6 +4,7 @@ import argparse
 import io
 import tempfile
 import random
+from contextlib import asynccontextmanager
 from typing import Optional, List
 from enum import Enum
 
@@ -41,19 +42,11 @@ PROMPT_SR = 16000
 cosyvoice: Optional[AutoModel] = None
 sft_spk: List[str] = []
 
-# ===================== FastAPI 实例 =====================
-
-app = FastAPI(
-    title="CosyVoice TTS Service",
-    description="基于 CosyVoice 的语音合成 RESTful API，一次性返回完整音频",
-    version="1.0.0",
-)
-
 
 # ===================== 启动时加载模型 =====================
 
-@app.on_event("startup")
-async def load_model():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """应用启动时加载模型"""
     global cosyvoice, sft_spk
     model_dir = os.environ.get("COSYVOICE_MODEL_DIR", args.model_dir)
@@ -62,6 +55,16 @@ async def load_model():
     if len(sft_spk) == 0:
         sft_spk = [""]
     logging.info(f"Model loaded from {model_dir}, available speakers: {sft_spk}")
+    yield
+# ===================== FastAPI 实例 =====================
+
+
+app = FastAPI(
+    title="CosyVoice TTS Service",
+    description="基于 CosyVoice 的语音合成 RESTful API，一次性返回完整音频",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 
 # ===================== 工具函数 =====================
