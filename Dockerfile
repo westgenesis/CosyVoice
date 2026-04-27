@@ -15,6 +15,8 @@ RUN pip install openai-whisper==20231117  -i https://mirrors.aliyun.com/pypi/sim
 RUN pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com --no-cache-dir
 
 COPY third_party third_party
+# 替换third_party里面的requirements.txt 的diffusers==0.25.0为diffusers==0.29.0
+RUN sed -i 's/diffusers==0.25.0/diffusers==0.29.0/g' third_party/Matcha-TTS/requirements.txt
 RUN pip install -e third_party/Matcha-TTS -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com --no-cache-dir
 COPY asset  asset
 COPY app.py app.py
