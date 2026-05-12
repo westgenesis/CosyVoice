@@ -1,11 +1,12 @@
 services:
   cosyvoice:
-#    image: chise/cosyvoice:v0.1
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: voice:v0.1.0
+#    build:
+#      context: .
+#      dockerfile: Dockerfile
     volumes:
       - ./pretrained_models:/opt/CosyVoice/pretrained_models
+      - ./third_party:/opt/CosyVoice/third_party
       - ./cache:/root/.cache
       - ./triton:/root.triton
     container_name: cosyvoice
@@ -14,7 +15,14 @@ services:
     environment:
       - HF_ENDPOINT=https://hf-mirror.com
     command:
-      - "python"
+      - "python3"
       - "app.py"
       - "--model_dir=pretrained_models/CosyVoice2-0.5B"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     restart: unless-stopped

@@ -2,11 +2,11 @@ import os
 import sys
 import argparse
 import io
+import json
 import tempfile
 import random
 from contextlib import asynccontextmanager
-from typing import Optional, List
-from enum import Enum
+from typing import Optional, List, Set
 
 import numpy as np
 import torch
@@ -25,52 +25,64 @@ from cosyvoice.utils.file_utils import logging
 from cosyvoice.utils.common import set_all_random_seed
 
 
-# ===================== 枚举 & 常量 =====================
-
-class InferenceMode(str, Enum):
-    """推理模式"""
-    PRETRAINED = "预训练音色"
-    ZERO_SHOT = "3s极速复刻"
-    CROSS_LINGUAL = "跨语种复刻"
-    INSTRUCT = "自然语言控制"
-
-
+# ===================== 常量 =====================
 PROMPT_SR = 16000
+CLONED_SPKS_FILE = "cloned_spks.json"
+
 
 # ===================== 全局模型 =====================
-
 cosyvoice: Optional[AutoModel] = None
 sft_spk: List[str] = []
+cloned_spks: Set[str] = set()
+_model_dir: str = ""
 
 
 # ===================== 启动时加载模型 =====================
 
+def _load_cloned_spks() -> Set[str]:
+    path = os.path.join(_model_dir, CLONED_SPKS_FILE)
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return set(json.load(f))
+    return set()
+
+
+def _save_cloned_spks():
+    path = os.path.join(_model_dir, CLONED_SPKS_FILE)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(sorted(cloned_spks), f, ensure_ascii=False)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用启动时加载模型"""
-    global cosyvoice, sft_spk
-    model_dir = os.environ.get("COSYVOICE_MODEL_DIR", args.model_dir)
-    cosyvoice = AutoModel(model_dir=model_dir)
+    global cosyvoice, sft_spk, cloned_spks, _model_dir
+    _model_dir = os.environ.get("COSYVOICE_MODEL_DIR", args.model_dir)
+    cosyvoice = AutoModel(model_dir=_model_dir)
     sft_spk = cosyvoice.list_available_spks()
     if len(sft_spk) == 0:
         sft_spk = [""]
-    logging.info(f"Model loaded from {model_dir}, available speakers: {sft_spk}")
+    cloned_spks = _load_cloned_spks()
+    # 清理 spk2info 中可能残留的无效条目（已被手动删除但 spk2info.pt 仍有）
+    for spk in list(cloned_spks):
+        if spk not in cosyvoice.frontend.spk2info:
+            cloned_spks.discard(spk)
+    logging.info(f"Model loaded from {_model_dir}, sft speakers: {sft_spk}, cloned: {sorted(cloned_spks)}")
     yield
-# ===================== FastAPI 实例 =====================
 
+
+# ===================== FastAPI 实例 =====================
 
 app = FastAPI(
     title="CosyVoice TTS Service",
-    description="基于 CosyVoice 的语音合成 RESTful API，一次性返回完整音频",
-    version="1.0.0",
-    lifespan=lifespan
+    description="基于 CosyVoice 的语音合成 RESTful API",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
 
 # ===================== 工具函数 =====================
 
 def _save_upload_wav(upload_file: UploadFile) -> str:
-    """将上传的音频文件保存到临时路径并返回路径"""
     suffix = os.path.splitext(upload_file.filename or "wav")[1] or ".wav"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(upload_file.file.read())
@@ -79,10 +91,6 @@ def _save_upload_wav(upload_file: UploadFile) -> str:
 
 
 def _collect_full_audio(generator):
-    """
-    从 CosyVoice 的生成器中收集所有音频片段并拼接，
-    确保一次性返回完整音频而不是分段流式返回。
-    """
     chunks = []
     for item in generator:
         chunks.append(item["tts_speech"].numpy().flatten())
@@ -92,140 +100,297 @@ def _collect_full_audio(generator):
 
 
 def _numpy_to_wav_bytes(audio_np: np.ndarray, sample_rate: int) -> io.BytesIO:
-    """将 numpy 数组转为 WAV 格式的 BytesIO 对象"""
-    tensor = torch.from_numpy(audio_np).unsqueeze(0)  # (1, T)
+    tensor = torch.from_numpy(audio_np).unsqueeze(0)
     buffer = io.BytesIO()
     torchaudio.save(buffer, tensor, sample_rate, format="wav")
     buffer.seek(0)
     return buffer
 
 
-# ===================== API 接口 =====================
+def _check_prompt_wav(prompt_wav_path: str):
+    """校验 prompt 音频采样率"""
+    wav_info = torchaudio.info(prompt_wav_path)
+    if wav_info.sample_rate < PROMPT_SR:
+        raise HTTPException(
+            status_code=400,
+            detail=f"prompt 音频采样率 {wav_info.sample_rate} 低于最低要求 {PROMPT_SR}",
+        )
 
-@app.get("/api/speakers", summary="获取可用预训练音色列表")
-async def get_speakers():
-    """返回当前模型支持的所有预训练音色"""
-    return JSONResponse(content={"speakers": sft_spk})
+
+def _resolve_seed(seed: int) -> int:
+    actual = seed if seed != 0 else random.randint(1, 100000000)
+    set_all_random_seed(actual)
+    return actual
 
 
-@app.post("/api/tts", summary="语音合成（一次性返回完整音频）")
-async def text_to_speech(
-        tts_text: str = Form(..., description="需要合成的文本"),
-        mode: InferenceMode = Form(..., description="推理模式: 预训练音色 / 3s极速复刻 / 跨语种复刻 / 自然语言控制"),
-        sft_speaker: Optional[str] = Form(default=None,
-                                          description="预训练音色名称（预训练音色 / 自然语言控制 模式使用）"),
-        prompt_text: Optional[str] = Form(default=None,
-                                          description="prompt文本（3s极速复刻 模式使用，需与prompt音频内容一致）"),
-        prompt_wav: Optional[UploadFile] = File(default=None,
-                                                description="prompt音频文件（3s极速复刻 / 跨语种复刻 模式使用，采样率≥16kHz，不超过30s）"),
-        instruct_text: Optional[str] = Form(default=None, description="instruct文本（自然语言控制 模式使用）"),
-        seed: int = Form(default=0, description="随机推理种子，传入 0 表示随机生成"),
-        speed: float = Form(default=1.0, ge=0.5, le=2.0, description="语速调节，范围 0.5~2.0"),
-):
-    """
-    根据指定的推理模式合成语音。
-
-    所有音频片段生成完毕后拼接为一个完整的 WAV 文件一次性返回。
-    """
-
-    # ---------- 保存上传的 prompt 音频 ----------
-    prompt_wav_path: Optional[str] = None
-    if prompt_wav is not None and prompt_wav.filename:
-        prompt_wav_path = _save_upload_wav(prompt_wav)
-
-    # ---------- 模式参数校验 ----------
-
-    # 自然语言控制模式
-    if mode == InferenceMode.INSTRUCT:
-        if not instruct_text:
-            raise HTTPException(status_code=400, detail="自然语言控制模式需要提供 instruct_text")
-        if prompt_wav_path or prompt_text:
-            logging.info("自然语言控制模式: prompt音频/prompt文本将被忽略")
-
-    # 跨语种复刻模式
-    if mode == InferenceMode.CROSS_LINGUAL:
-        if instruct_text:
-            logging.info("跨语种复刻模式: instruct文本将被忽略")
-        if prompt_wav_path is None:
-            raise HTTPException(status_code=400, detail="跨语种复刻模式需要提供 prompt_wav 音频文件")
-
-    # 3s极速复刻 / 跨语种复刻 共用的校验
-    if mode in (InferenceMode.ZERO_SHOT, InferenceMode.CROSS_LINGUAL):
-        if prompt_wav_path is None:
-            raise HTTPException(status_code=400, detail="当前模式需要提供 prompt_wav 音频文件")
-        wav_info = torchaudio.info(prompt_wav_path)
-        if wav_info.sample_rate < PROMPT_SR:
-            raise HTTPException(
-                status_code=400,
-                detail=f"prompt音频采样率 {wav_info.sample_rate} 低于最低要求 {PROMPT_SR}",
-            )
-
-    # 预训练音色模式
-    if mode == InferenceMode.PRETRAINED:
-        if instruct_text or prompt_wav_path or prompt_text:
-            logging.info("预训练音色模式: prompt文本/prompt音频/instruct文本将被忽略")
-        if not sft_speaker:
-            raise HTTPException(status_code=400, detail="预训练音色模式需要提供 sft_speaker")
-
-    # 3s极速复刻模式
-    if mode == InferenceMode.ZERO_SHOT:
-        if not prompt_text:
-            raise HTTPException(status_code=400, detail="3s极速复刻模式需要提供 prompt_text")
-        if instruct_text:
-            logging.info("3s极速复刻模式: instruct文本将被忽略")
-
-    # ---------- 随机种子 ----------
-    actual_seed = seed if seed != 0 else random.randint(1, 100000000)
-    set_all_random_seed(actual_seed)
-
-    # ---------- 推理（统一 stream=False，收集所有片段后一次性返回） ----------
-    audio_np = np.array([])
-    try:
-        if mode == InferenceMode.PRETRAINED:
-            logging.info("get sft inference request")
-            audio_np = _collect_full_audio(
-                cosyvoice.inference_sft(tts_text, sft_speaker, stream=False, speed=speed)
-            )
-        elif mode == InferenceMode.ZERO_SHOT:
-            logging.info("get zero_shot inference request")
-            audio_np = _collect_full_audio(
-                cosyvoice.inference_zero_shot(
-                    tts_text, prompt_text, prompt_wav_path, stream=False, speed=speed
-                )
-            )
-        elif mode == InferenceMode.CROSS_LINGUAL:
-            logging.info("get cross_lingual inference request")
-            audio_np = _collect_full_audio(
-                cosyvoice.inference_cross_lingual(
-                    tts_text, prompt_wav_path, stream=False, speed=speed
-                )
-            )
-        elif mode == InferenceMode.INSTRUCT:
-            logging.info("get instruct inference request")
-            audio_np = _collect_full_audio(
-                cosyvoice.inference_instruct(
-                    tts_text, sft_speaker, instruct_text, stream=False, speed=speed
-                )
-            )
-    finally:
-        # 无论成功失败都清理临时文件
-        if prompt_wav_path is not None:
-            try:
-                os.unlink(prompt_wav_path)
-            except OSError:
-                pass
-
-    # ---------- 空音频检查 ----------
+def _tts_response(audio_np: np.ndarray):
+    """将合成音频封装为 StreamingResponse"""
     if audio_np.size == 0:
         raise HTTPException(status_code=500, detail="音频生成失败，结果为空")
-
-    # ---------- 返回完整 WAV ----------
     wav_buffer = _numpy_to_wav_bytes(audio_np, cosyvoice.sample_rate)
     return StreamingResponse(
         wav_buffer,
         media_type="audio/wav",
         headers={"Content-Disposition": "attachment; filename=tts_output.wav"},
     )
+
+
+def _vc_with_cached_spk(source_wav_path: str, spk_id: str, speed: float):
+    """使用已注册音色进行语音转换"""
+    cached = cosyvoice.frontend.spk2info[spk_id]
+    source_speech_token, source_speech_token_len = cosyvoice.frontend._extract_speech_token(source_wav_path)
+    model_input = {
+        'source_speech_token': source_speech_token,
+        'source_speech_token_len': source_speech_token_len,
+        'flow_prompt_speech_token': cached['flow_prompt_speech_token'],
+        'flow_prompt_speech_token_len': cached['flow_prompt_speech_token_len'],
+        'prompt_speech_feat': cached['prompt_speech_feat'],
+        'prompt_speech_feat_len': cached['prompt_speech_feat_len'],
+        'flow_embedding': cached['flow_embedding'],
+    }
+    for model_output in cosyvoice.model.tts(**model_input, stream=False, speed=speed):
+        yield model_output
+
+
+# ===================== 查询接口 =====================
+
+@app.get("/api/speakers", summary="获取所有可用音色（预训练 + 已克隆）")
+async def get_speakers():
+    return JSONResponse(content={
+        "sft_speakers": sft_spk,
+        "cloned_speakers": sorted(cloned_spks),
+    })
+
+
+# ===================== 音色克隆接口 =====================
+
+@app.post("/api/clone", summary="注册克隆音色并持久化为 pt 文件")
+async def clone_voice(
+    spk_id: str = Form(..., description="克隆音色名称（唯一标识）"),
+    prompt_wav: UploadFile = File(..., description="参考音频（采样率 ≥ 16kHz，时长 ≤ 30s）"),
+    prompt_text: Optional[str] = Form(default=None, description="参考音频对应的文本（提供则走 zero-shot 模式，不提供则走跨语种模式）"),
+):
+    """提取参考音频的音色特征并持久化到 spk2info.pt，后续 TTS/VC 接口可直接使用 spk_id。"""
+    if spk_id in sft_spk:
+        raise HTTPException(status_code=400, detail=f"spk_id '{spk_id}' 与预训练音色冲突")
+
+    prompt_wav_path = _save_upload_wav(prompt_wav)
+    try:
+        _check_prompt_wav(prompt_wav_path)
+
+        if prompt_text:
+            cosyvoice.add_zero_shot_spk(prompt_text, prompt_wav_path, spk_id)
+        else:
+            # 跨语种模式：prompt_text 留空，但仍然需要前端提取流程
+            model_input = cosyvoice.frontend.frontend_zero_shot('', '', prompt_wav_path, cosyvoice.sample_rate, '')
+            del model_input['text']
+            del model_input['text_len']
+            cosyvoice.frontend.spk2info[spk_id] = model_input
+
+        cosyvoice.save_spkinfo()
+        cloned_spks.add(spk_id)
+        _save_cloned_spks()
+        logging.info(f"Cloned voice '{spk_id}' registered and saved to spk2info.pt")
+        return JSONResponse(content={"status": "ok", "spk_id": spk_id})
+    finally:
+        try:
+            os.unlink(prompt_wav_path)
+        except OSError:
+            pass
+
+
+@app.get("/api/clone", summary="列出已克隆音色")
+async def list_cloned():
+    return JSONResponse(content={"cloned_speakers": sorted(cloned_spks)})
+
+
+@app.delete("/api/clone/{spk_id}", summary="删除克隆音色")
+async def delete_clone(spk_id: str):
+    if spk_id not in cloned_spks:
+        raise HTTPException(status_code=404, detail=f"克隆音色 '{spk_id}' 不存在")
+    del cosyvoice.frontend.spk2info[spk_id]
+    cloned_spks.discard(spk_id)
+    cosyvoice.save_spkinfo()
+    _save_cloned_spks()
+    logging.info(f"Cloned voice '{spk_id}' removed from spk2info.pt")
+    return JSONResponse(content={"status": "ok", "spk_id": spk_id})
+
+
+# ===================== TTS 接口（四种模式各自独立） =====================
+
+@app.post("/api/tts/sft", summary="预训练音色合成")
+async def tts_sft(
+    tts_text: str = Form(..., description="需要合成的文本"),
+    spk_id: str = Form(..., description="预训练音色名称"),
+    speed: float = Form(default=1.0, ge=0.5, le=2.0, description="语速 0.5~2.0"),
+    seed: int = Form(default=0, description="随机种子，0 表示随机"),
+):
+    if spk_id not in sft_spk:
+        raise HTTPException(status_code=400, detail=f"预训练音色 '{spk_id}' 不存在")
+    _resolve_seed(seed)
+    logging.info(f"sft TTS: spk={spk_id}, text={tts_text[:50]}...")
+    audio_np = _collect_full_audio(
+        cosyvoice.inference_sft(tts_text, spk_id, stream=False, speed=speed)
+    )
+    return _tts_response(audio_np)
+
+
+@app.post("/api/tts/zero_shot", summary="3s 极速复刻合成")
+async def tts_zero_shot(
+    tts_text: str = Form(..., description="需要合成的文本"),
+    spk_id: Optional[str] = Form(default=None, description="已克隆音色名称（二选一：spk_id 或 prompt_wav + prompt_text）"),
+    prompt_wav: Optional[UploadFile] = File(default=None, description="参考音频（未注册音色时使用）"),
+    prompt_text: Optional[str] = Form(default=None, description="参考音频对应的文本（未注册音色时使用）"),
+    speed: float = Form(default=1.0, ge=0.5, le=2.0, description="语速 0.5~2.0"),
+    seed: int = Form(default=0, description="随机种子，0 表示随机"),
+):
+    # 参数校验：spk_id 或 (prompt_wav + prompt_text) 二选一
+    use_cached = spk_id is not None and spk_id != ''
+    use_adhoc = prompt_wav is not None and prompt_wav.filename
+
+    if use_cached and use_adhoc:
+        raise HTTPException(status_code=400, detail="spk_id 和 prompt_wav 不能同时提供，请二选一")
+    if not use_cached and not use_adhoc:
+        raise HTTPException(status_code=400, detail="请提供 spk_id（已克隆音色）或 prompt_wav + prompt_text（即时复刻）")
+    if use_adhoc and not prompt_text:
+        raise HTTPException(status_code=400, detail="即时复刻需要同时提供 prompt_wav 和 prompt_text")
+
+    _resolve_seed(seed)
+
+    prompt_wav_path: Optional[str] = None
+    try:
+        if use_cached:
+            if spk_id not in cosyvoice.frontend.spk2info:
+                raise HTTPException(status_code=400, detail=f"音色 '{spk_id}' 未注册，请先调用 /api/clone")
+            logging.info(f"zero_shot TTS (cached): spk={spk_id}, text={tts_text[:50]}...")
+            audio_np = _collect_full_audio(
+                cosyvoice.inference_zero_shot(tts_text, '', '', spk_id, stream=False, speed=speed)
+            )
+        else:
+            prompt_wav_path = _save_upload_wav(prompt_wav)
+            _check_prompt_wav(prompt_wav_path)
+            logging.info(f"zero_shot TTS (adhoc): text={tts_text[:50]}...")
+            audio_np = _collect_full_audio(
+                cosyvoice.inference_zero_shot(tts_text, prompt_text, prompt_wav_path, '', stream=False, speed=speed)
+            )
+        return _tts_response(audio_np)
+    finally:
+        if prompt_wav_path:
+            try:
+                os.unlink(prompt_wav_path)
+            except OSError:
+                pass
+
+
+@app.post("/api/tts/cross_lingual", summary="跨语种复刻合成")
+async def tts_cross_lingual(
+    tts_text: str = Form(..., description="需要合成的文本"),
+    spk_id: Optional[str] = Form(default=None, description="已克隆音色名称（二选一：spk_id 或 prompt_wav）"),
+    prompt_wav: Optional[UploadFile] = File(default=None, description="参考音频（未注册音色时使用）"),
+    speed: float = Form(default=1.0, ge=0.5, le=2.0, description="语速 0.5~2.0"),
+    seed: int = Form(default=0, description="随机种子，0 表示随机"),
+):
+    use_cached = spk_id is not None and spk_id != ''
+    use_adhoc = prompt_wav is not None and prompt_wav.filename
+
+    if use_cached and use_adhoc:
+        raise HTTPException(status_code=400, detail="spk_id 和 prompt_wav 不能同时提供，请二选一")
+    if not use_cached and not use_adhoc:
+        raise HTTPException(status_code=400, detail="请提供 spk_id（已克隆音色）或 prompt_wav（即时复刻）")
+
+    _resolve_seed(seed)
+
+    prompt_wav_path: Optional[str] = None
+    try:
+        if use_cached:
+            if spk_id not in cosyvoice.frontend.spk2info:
+                raise HTTPException(status_code=400, detail=f"音色 '{spk_id}' 未注册，请先调用 /api/clone")
+            logging.info(f"cross_lingual TTS (cached): spk={spk_id}, text={tts_text[:50]}...")
+            audio_np = _collect_full_audio(
+                cosyvoice.inference_cross_lingual(tts_text, '', spk_id, stream=False, speed=speed)
+            )
+        else:
+            prompt_wav_path = _save_upload_wav(prompt_wav)
+            _check_prompt_wav(prompt_wav_path)
+            logging.info(f"cross_lingual TTS (adhoc): text={tts_text[:50]}...")
+            audio_np = _collect_full_audio(
+                cosyvoice.inference_cross_lingual(tts_text, prompt_wav_path, '', stream=False, speed=speed)
+            )
+        return _tts_response(audio_np)
+    finally:
+        if prompt_wav_path:
+            try:
+                os.unlink(prompt_wav_path)
+            except OSError:
+                pass
+
+
+@app.post("/api/tts/instruct", summary="自然语言控制合成")
+async def tts_instruct(
+    tts_text: str = Form(..., description="需要合成的文本"),
+    spk_id: str = Form(..., description="预训练音色名称"),
+    instruct_text: str = Form(..., description="自然语言控制指令"),
+    speed: float = Form(default=1.0, ge=0.5, le=2.0, description="语速 0.5~2.0"),
+    seed: int = Form(default=0, description="随机种子，0 表示随机"),
+):
+    if spk_id not in sft_spk:
+        raise HTTPException(status_code=400, detail=f"预训练音色 '{spk_id}' 不存在")
+    _resolve_seed(seed)
+    logging.info(f"instruct TTS: spk={spk_id}, instruct={instruct_text[:50]}, text={tts_text[:50]}...")
+    audio_np = _collect_full_audio(
+        cosyvoice.inference_instruct(tts_text, spk_id, instruct_text, stream=False, speed=speed)
+    )
+    return _tts_response(audio_np)
+
+
+# ===================== 语音转换接口 =====================
+
+@app.post("/api/vc", summary="语音转换（将源音频转换为目标音色）")
+async def voice_conversion(
+    source_wav: UploadFile = File(..., description="待转换的源音频"),
+    spk_id: Optional[str] = Form(default=None, description="已克隆音色名称（二选一：spk_id 或 prompt_wav）"),
+    prompt_wav: Optional[UploadFile] = File(default=None, description="参考音频（未注册音色时使用）"),
+    speed: float = Form(default=1.0, ge=0.5, le=2.0, description="语速 0.5~2.0"),
+    seed: int = Form(default=0, description="随机种子，0 表示随机"),
+):
+    use_cached = spk_id is not None and spk_id != ''
+    use_adhoc = prompt_wav is not None and prompt_wav.filename
+
+    if use_cached and use_adhoc:
+        raise HTTPException(status_code=400, detail="spk_id 和 prompt_wav 不能同时提供，请二选一")
+    if not use_cached and not use_adhoc:
+        raise HTTPException(status_code=400, detail="请提供 spk_id（已克隆音色）或 prompt_wav（即时转换）")
+
+    _resolve_seed(seed)
+
+    source_wav_path = _save_upload_wav(source_wav)
+    prompt_wav_path: Optional[str] = None
+    try:
+        if use_cached:
+            if spk_id not in cosyvoice.frontend.spk2info:
+                raise HTTPException(status_code=400, detail=f"音色 '{spk_id}' 未注册，请先调用 /api/clone")
+            logging.info(f"VC (cached): spk={spk_id}")
+            audio_np = _collect_full_audio(
+                _vc_with_cached_spk(source_wav_path, spk_id, speed)
+            )
+        else:
+            prompt_wav_path = _save_upload_wav(prompt_wav)
+            _check_prompt_wav(prompt_wav_path)
+            logging.info(f"VC (adhoc)")
+            audio_np = _collect_full_audio(
+                cosyvoice.inference_vc(source_wav_path, prompt_wav_path, stream=False, speed=speed)
+            )
+        return _tts_response(audio_np)
+    finally:
+        try:
+            os.unlink(source_wav_path)
+        except OSError:
+            pass
+        if prompt_wav_path:
+            try:
+                os.unlink(prompt_wav_path)
+            except OSError:
+                pass
 
 
 # ===================== 启动入口 =====================
@@ -238,7 +403,6 @@ if __name__ == "__main__":
         "--model_dir",
         type=str,
         default="pretrained_models/CosyVoice2-0.5B",
-        # default="pretrained_models/CosyVoice-300M-SFT",
         help="模型本地路径或 ModelScope repo id",
     )
     args = parser.parse_args()

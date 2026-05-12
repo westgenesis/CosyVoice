@@ -14,7 +14,7 @@
 # limitations under the License.
 import torch
 import torch.nn.functional as F
-from matcha.models.components.flow_matching import BASECFM
+from cosyvoice.utils.matcha_components import BASECFM
 from cosyvoice.utils.common import set_all_random_seed
 
 
