@@ -3,7 +3,7 @@ import sys
 import argparse
 import io
 import json
-import tempfile
+import uuid
 import random
 from contextlib import asynccontextmanager
 from typing import Optional, List, Set
@@ -24,11 +24,9 @@ from cosyvoice.cli.cosyvoice import AutoModel
 from cosyvoice.utils.file_utils import logging
 from cosyvoice.utils.common import set_all_random_seed
 
-
 # ===================== 常量 =====================
 PROMPT_SR = 16000
 CLONED_SPKS_FILE = "cloned_spks.json"
-
 
 # ===================== 全局模型 =====================
 cosyvoice: Optional[AutoModel] = None
@@ -84,10 +82,10 @@ app = FastAPI(
 
 def _save_upload_wav(upload_file: UploadFile) -> str:
     suffix = os.path.splitext(upload_file.filename or "wav")[1] or ".wav"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.write(upload_file.file.read())
-    tmp.close()
-    return tmp.name
+    file_path = os.path.join("tmp", str(uuid.uuid4()) + suffix)
+    with open(file_path, 'wb') as f:
+        f.write(upload_file.file.read())
+    return file_path
 
 
 def _collect_full_audio(generator):
@@ -168,7 +166,8 @@ async def get_speakers():
 async def clone_voice(
     spk_id: str = Form(..., description="克隆音色名称（唯一标识）"),
     prompt_wav: UploadFile = File(..., description="参考音频（采样率 ≥ 16kHz，时长 ≤ 30s）"),
-    prompt_text: Optional[str] = Form(default=None, description="参考音频对应的文本（提供则走 zero-shot 模式，不提供则走跨语种模式）"),
+    prompt_text: Optional[str] = Form(default=None,
+                                      description="参考音频对应的文本（提供则走 zero-shot 模式，不提供则走跨语种模式）"),
 ):
     """提取参考音频的音色特征并持久化到 spk2info.pt，后续 TTS/VC 接口可直接使用 spk_id。"""
     if spk_id in sft_spk:
@@ -194,7 +193,7 @@ async def clone_voice(
         return JSONResponse(content={"status": "ok", "spk_id": spk_id})
     finally:
         try:
-            os.unlink(prompt_wav_path)
+            os.remove(prompt_wav_path)
         except OSError:
             pass
 
@@ -238,7 +237,8 @@ async def tts_sft(
 @app.post("/api/tts/zero_shot", summary="3s 极速复刻合成")
 async def tts_zero_shot(
     tts_text: str = Form(..., description="需要合成的文本"),
-    spk_id: Optional[str] = Form(default=None, description="已克隆音色名称（二选一：spk_id 或 prompt_wav + prompt_text）"),
+    spk_id: Optional[str] = Form(default=None,
+                                 description="已克隆音色名称（二选一：spk_id 或 prompt_wav + prompt_text）"),
     prompt_wav: Optional[UploadFile] = File(default=None, description="参考音频（未注册音色时使用）"),
     prompt_text: Optional[str] = Form(default=None, description="参考音频对应的文本（未注册音色时使用）"),
     speed: float = Form(default=1.0, ge=0.5, le=2.0, description="语速 0.5~2.0"),
@@ -277,7 +277,7 @@ async def tts_zero_shot(
     finally:
         if prompt_wav_path:
             try:
-                os.unlink(prompt_wav_path)
+                os.remove(prompt_wav_path)
             except OSError:
                 pass
 
@@ -320,7 +320,7 @@ async def tts_cross_lingual(
     finally:
         if prompt_wav_path:
             try:
-                os.unlink(prompt_wav_path)
+                os.remove(prompt_wav_path)
             except OSError:
                 pass
 
@@ -388,7 +388,7 @@ async def voice_conversion(
             pass
         if prompt_wav_path:
             try:
-                os.unlink(prompt_wav_path)
+                os.remove(prompt_wav_path)
             except OSError:
                 pass
 
