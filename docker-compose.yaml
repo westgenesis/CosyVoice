@@ -1,6 +1,6 @@
 services:
   cosyvoice:
-    image: voice:v0.1.0
+    image: voice:v0.4.0
 #    build:
 #      context: .
 #      dockerfile: Dockerfile
