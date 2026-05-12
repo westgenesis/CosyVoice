@@ -81,8 +81,14 @@ app = FastAPI(
 # ===================== 工具函数 =====================
 
 def _save_upload_wav(upload_file: UploadFile) -> str:
+    """保存上传的音频文件到临时目录，使用UUID确保文件名唯一"""
+    # 确保 tmp 目录存在
+    tmp_dir = "tmp"
+    if not os.path.exists(tmp_dir):
+        os.makedirs(tmp_dir, exist_ok=True)
+    
     suffix = os.path.splitext(upload_file.filename or "wav")[1] or ".wav"
-    file_path = os.path.join("tmp", str(uuid.uuid4()) + suffix)
+    file_path = os.path.join(tmp_dir, str(uuid.uuid4()) + suffix)
     with open(file_path, 'wb') as f:
         f.write(upload_file.file.read())
     return file_path
