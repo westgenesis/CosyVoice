@@ -1,9 +1,9 @@
 services:
   cosyvoice:
-    image: voice:v0.4.0
-#    build:
-#      context: .
-#      dockerfile: Dockerfile
+#    image: voice:v0.5.0
+    build:
+      context: .
+      dockerfile: Dockerfile
     volumes:
       - ./pretrained_models:/opt/CosyVoice/pretrained_models
       - ./third_party:/opt/CosyVoice/third_party

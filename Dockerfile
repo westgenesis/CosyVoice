@@ -14,6 +14,8 @@ COPY requirements.txt .
 RUN pip install openai-whisper==20231117  -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com --no-cache-dir  --no-build-isolation
 RUN pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com --no-cache-dir
 
+COPY pretrained_models/CosyVoice-ttsfrd/ pretrained_models/CosyVoice-ttsfrd
+RUN cd  pretrained_models/CosyVoice-ttsfrd && tar -zxvf resource.tar && pip install ttsfrd_dependency-0.1-py3-none-any.whl && pip install ttsfrd-0.4.2-cp310-cp310-linux_x86_64.whl
 COPY asset  asset
 COPY app.py app.py
 COPY cosyvoice cosyvoice
