@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import threading
 import torch
 import torch.nn.functional as F
-from cosyvoice.utils.matcha_components import BASECFM
-from cosyvoice.utils.common import set_all_random_seed
+from matcha.models.components.flow_matching import BASECFM
 
 
 class ConditionalCFM(BASECFM):
@@ -32,6 +32,7 @@ class ConditionalCFM(BASECFM):
         in_channels = in_channels + (spk_emb_dim if n_spks > 0 else 0)
         # Just change the architecture of the estimator here
         self.estimator = estimator
+        self.lock = threading.Lock()
 
     @torch.inference_mode()
     def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, prompt_len=0, cache=torch.zeros(1, 80, 0, 2)):
@@ -68,7 +69,7 @@ class ConditionalCFM(BASECFM):
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
         return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), cache
 
-    def solve_euler(self, x, t_span, mu, mask, spks, cond, streaming=False):
+    def solve_euler(self, x, t_span, mu, mask, spks, cond):
         """
         Fixed euler solver for ODEs.
         Args:
@@ -91,13 +92,12 @@ class ConditionalCFM(BASECFM):
         sol = []
 
         # Do not use concat, it may cause memory format changed and trt infer with wrong results!
-        # NOTE when flow run in amp mode, x.dtype is float32, which cause nan in trt fp16 inference, so set dtype=spks.dtype
-        x_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=spks.dtype)
-        mask_in = torch.zeros([2, 1, x.size(2)], device=x.device, dtype=spks.dtype)
-        mu_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=spks.dtype)
-        t_in = torch.zeros([2], device=x.device, dtype=spks.dtype)
-        spks_in = torch.zeros([2, 80], device=x.device, dtype=spks.dtype)
-        cond_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=spks.dtype)
+        x_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
+        mask_in = torch.zeros([2, 1, x.size(2)], device=x.device, dtype=x.dtype)
+        mu_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
+        t_in = torch.zeros([2], device=x.device, dtype=x.dtype)
+        spks_in = torch.zeros([2, 80], device=x.device, dtype=x.dtype)
+        cond_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
         for step in range(1, len(t_span)):
             # Classifier-Free Guidance inference introduced in VoiceBox
             x_in[:] = x
@@ -110,8 +110,7 @@ class ConditionalCFM(BASECFM):
                 x_in, mask_in,
                 mu_in, t_in,
                 spks_in,
-                cond_in,
-                streaming
+                cond_in
             )
             dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
             dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt)
@@ -123,13 +122,11 @@ class ConditionalCFM(BASECFM):
 
         return sol[-1].float()
 
-    def forward_estimator(self, x, mask, mu, t, spks, cond, streaming=False):
+    def forward_estimator(self, x, mask, mu, t, spks, cond):
         if isinstance(self.estimator, torch.nn.Module):
-            return self.estimator(x, mask, mu, t, spks, cond, streaming=streaming)
+            return self.estimator(x, mask, mu, t, spks, cond)
         else:
             [estimator, stream], trt_engine = self.estimator.acquire_estimator()
-            # NOTE need to synchronize when switching stream
-            torch.cuda.current_stream().synchronize()
             with stream:
                 estimator.set_input_shape('x', (2, 80, x.size(2)))
                 estimator.set_input_shape('mask', (2, 1, x.size(2)))
@@ -138,12 +135,12 @@ class ConditionalCFM(BASECFM):
                 estimator.set_input_shape('spks', (2, 80))
                 estimator.set_input_shape('cond', (2, 80, x.size(2)))
                 data_ptrs = [x.contiguous().data_ptr(),
-                             mask.contiguous().data_ptr(),
-                             mu.contiguous().data_ptr(),
-                             t.contiguous().data_ptr(),
-                             spks.contiguous().data_ptr(),
-                             cond.contiguous().data_ptr(),
-                             x.data_ptr()]
+                            mask.contiguous().data_ptr(),
+                            mu.contiguous().data_ptr(),
+                            t.contiguous().data_ptr(),
+                            spks.contiguous().data_ptr(),
+                            cond.contiguous().data_ptr(),
+                            x.data_ptr()]
                 for i, j in enumerate(data_ptrs):
                     estimator.set_tensor_address(trt_engine.get_tensor_name(i), j)
                 # run trt engine
@@ -174,7 +171,8 @@ class ConditionalCFM(BASECFM):
 
         # random timestep
         t = torch.rand([b, 1, 1], device=mu.device, dtype=mu.dtype)
-
+        if self.t_scheduler == 'cosine':
+            t = 1 - torch.cos(t * 0.5 * torch.pi)
         # sample noise p(x_0)
         z = torch.randn_like(x1)
 
@@ -196,11 +194,10 @@ class ConditionalCFM(BASECFM):
 class CausalConditionalCFM(ConditionalCFM):
     def __init__(self, in_channels, cfm_params, n_spks=1, spk_emb_dim=64, estimator: torch.nn.Module = None):
         super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
-        set_all_random_seed(0)
         self.rand_noise = torch.randn([1, 80, 50 * 300])
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, streaming=False):
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None):
         """Forward diffusion
 
         Args:
@@ -224,4 +221,4 @@ class CausalConditionalCFM(ConditionalCFM):
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         if self.t_scheduler == 'cosine':
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond, streaming=streaming), None
+        return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None

@@ -18,10 +18,8 @@ import torch.nn.functional as F
 from einops import pack, rearrange, repeat
 from cosyvoice.utils.common import mask_to_bias
 from cosyvoice.utils.mask import add_optional_chunk_mask
-from cosyvoice.utils.matcha_components import (
-    SinusoidalPosEmb, Block1D, ResnetBlock1D, Downsample1D, TimestepEmbedding, Upsample1D,
-    BasicTransformerBlock,
-)
+from matcha.models.components.decoder import SinusoidalPosEmb, Block1D, ResnetBlock1D, Downsample1D, TimestepEmbedding, Upsample1D
+from matcha.models.components.transformer import BasicTransformerBlock
 
 
 class Transpose(torch.nn.Module):
@@ -421,6 +419,10 @@ class CausalConditionalDecoder(ConditionalDecoder):
         Returns:
             _type_: _description_
         """
+        if hasattr(self, 'streaming'):
+            assert self.training is False, 'you have self.streaming attr, make sure that you are running inference mode'
+            streaming = self.streaming
+
         t = self.time_embeddings(t).to(t.dtype)
         t = self.time_mlp(t)
 

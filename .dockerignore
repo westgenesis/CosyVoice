@@ -1,0 +1,31 @@
+# Version control
+.git
+.gitattributes
+.gitignore
+
+# IDE
+.idea
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts
+Dockerfile
+Docker.file
+
+# Old Gradio app (replaced by main.py/fastapi_app.py)
+app.py
+
+# Test audio (not needed in production)
+zero_shot_prompt.wav
+
+# Docs
+README.md
+
+# OS garbage
+.DS_Store
+Thumbs.db
+*.log

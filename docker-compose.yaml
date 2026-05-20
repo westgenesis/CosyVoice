@@ -1,14 +1,9 @@
 services:
   cosyvoice:
-#    image: voice:v0.5.0
-    build:
-      context: .
-      dockerfile: Dockerfile
-    volumes:
-      - ./pretrained_models:/opt/CosyVoice/pretrained_models
-      - ./third_party:/opt/CosyVoice/third_party
-      - ./cache:/root/.cache
-      - ./triton:/root.triton
+    image: voice:v0.7.0
+#    build:
+#      context: .
+#      dockerfile: Dockerfile
     container_name: cosyvoice
     ports:
       - "50000:50000"
@@ -16,8 +11,7 @@ services:
       - HF_ENDPOINT=https://hf-mirror.com
     command:
       - "python3"
-      - "app.py"
-      - "--model_dir=pretrained_models/CosyVoice2-0.5B"
+      - "main.py"
     deploy:
       resources:
         reservations:

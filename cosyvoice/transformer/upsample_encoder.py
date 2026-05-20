@@ -64,18 +64,17 @@ class Upsample1D(nn.Module):
 
 
 class PreLookaheadLayer(nn.Module):
-    def __init__(self, in_channels: int, channels: int, pre_lookahead_len: int = 1):
+    def __init__(self, channels: int, pre_lookahead_len: int = 1):
         super().__init__()
-        self.in_channels = in_channels
         self.channels = channels
         self.pre_lookahead_len = pre_lookahead_len
         self.conv1 = nn.Conv1d(
-            in_channels, channels,
+            channels, channels,
             kernel_size=pre_lookahead_len + 1,
             stride=1, padding=0,
         )
         self.conv2 = nn.Conv1d(
-            channels, in_channels,
+            channels, channels,
             kernel_size=3, stride=1, padding=0,
         )
 
@@ -200,7 +199,7 @@ class UpsampleConformerEncoder(torch.nn.Module):
         # convolution module definition
         convolution_layer_args = (output_size, cnn_module_kernel, activation,
                                   cnn_module_norm, causal)
-        self.pre_lookahead_layer = PreLookaheadLayer(in_channels=512, channels=512, pre_lookahead_len=3)
+        self.pre_lookahead_layer = PreLookaheadLayer(channels=512, pre_lookahead_len=3)
         self.encoders = torch.nn.ModuleList([
             ConformerEncoderLayer(
                 output_size,
@@ -273,6 +272,9 @@ class UpsampleConformerEncoder(torch.nn.Module):
             checkpointing API because `__call__` attaches all the hooks of the module.
             https://discuss.pytorch.org/t/any-different-between-model-input-and-model-forward-input/3690/2
         """
+        if hasattr(self, 'streaming'):
+            assert self.training is False, 'you have self.streaming attr, make sure that you are running inference mode'
+            streaming = self.streaming
         T = xs.size(1)
         masks = ~make_pad_mask(xs_lens, T).unsqueeze(1)  # (B, 1, T)
         if self.global_cmvn is not None:
